@@ -54,6 +54,7 @@ func (r *PVCBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		logger.V(1).Info("skipped by watch filter")
 		return ctrl.Result{}, nil
 	}
+	metrics.SyncBackupLastSuccess(backup.Namespace, backup.Name, metrics.LastSuccessUnixFromStatus(backup.Status))
 
 	if !backup.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(&backup, finalizerHostPlan) {
@@ -293,10 +294,13 @@ func (r *PVCBackupReconciler) pollBackupJob(ctx context.Context, backup *operato
 		if backup.Spec.Schedule != "" {
 			backup.Status.Phase = "Scheduled"
 		}
-		backup.Status.LastBackupTime = time.Now().UTC().Format(time.RFC3339)
+		now := time.Now().UTC()
+		ts := now.Format(time.RFC3339)
+		backup.Status.LastBackupTime = ts
+		backup.Status.LastSuccessTime = ts
 		backup.Status.LastJobName = jobName
-		metrics.ObserveBackupSuccess(backup.Namespace, backup.Name, float64(time.Now().Unix()))
-		logger.Info("backup completed", "lastBackupTime", backup.Status.LastBackupTime)
+		metrics.ObserveBackupSuccess(backup.Namespace, backup.Name, float64(now.Unix()))
+		logger.Info("backup completed", "lastBackupTime", backup.Status.LastBackupTime, "lastSuccessTime", backup.Status.LastSuccessTime)
 
 		repoNS := backup.Spec.RepositoryRef.Namespace
 		if repoNS == "" {
@@ -733,14 +737,9 @@ func (r *PVCBackupReconciler) cloneFromSnapshot(ctx context.Context, b *operator
 
 func strPtr(s string) *string { return &s }
 
-func (r *PVCBackupReconciler) createResticBackupJob(ctx context.Context, b *operatorv1alpha1.PVCBackup, repo *operatorv1alpha1.BackupRepository, jobName string, pvcNames []string) error {
-	enableLinks := false
-	backoff := jobRetries(b)
-	ttl := int32(86400)
-	if b.Spec.TTLSecondsAfterFinished != nil {
-		ttl = *b.Spec.TTLSecondsAfterFinished
-	}
-
+// buildResticBackupJobVolumes builds PVC volumes/mounts for the restic backup Job.
+// Mounts are read-write so kubelet/CSI (e.g. TopoLVM) can chmod the mount point during SetUp.
+func buildResticBackupJobVolumes(b *operatorv1alpha1.PVCBackup, pvcNames []string) ([]corev1.Volume, []corev1.VolumeMount, []string) {
 	vols := []corev1.Volume{}
 	mounts := []corev1.VolumeMount{}
 	paths := b.Spec.Paths
@@ -755,10 +754,10 @@ func (r *PVCBackupReconciler) createResticBackupJob(ctx context.Context, b *oper
 			vols = append(vols, corev1.Volume{
 				Name: volName,
 				VolumeSource: corev1.VolumeSource{
-					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc, ReadOnly: true},
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc, ReadOnly: false},
 				},
 			})
-			mounts = append(mounts, corev1.VolumeMount{Name: volName, MountPath: mountPath, ReadOnly: true})
+			mounts = append(mounts, corev1.VolumeMount{Name: volName, MountPath: mountPath, ReadOnly: false})
 			paths = append(paths, mountPath)
 		}
 	} else {
@@ -771,12 +770,24 @@ func (r *PVCBackupReconciler) createResticBackupJob(ctx context.Context, b *oper
 			vols = append(vols, corev1.Volume{
 				Name: volName,
 				VolumeSource: corev1.VolumeSource{
-					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc, ReadOnly: true},
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc, ReadOnly: false},
 				},
 			})
-			mounts = append(mounts, corev1.VolumeMount{Name: volName, MountPath: mount, ReadOnly: true})
+			mounts = append(mounts, corev1.VolumeMount{Name: volName, MountPath: mount, ReadOnly: false})
 		}
 	}
+	return vols, mounts, paths
+}
+
+func (r *PVCBackupReconciler) createResticBackupJob(ctx context.Context, b *operatorv1alpha1.PVCBackup, repo *operatorv1alpha1.BackupRepository, jobName string, pvcNames []string) error {
+	enableLinks := false
+	backoff := jobRetries(b)
+	ttl := int32(86400)
+	if b.Spec.TTLSecondsAfterFinished != nil {
+		ttl = *b.Spec.TTLSecondsAfterFinished
+	}
+
+	vols, mounts, paths := buildResticBackupJobVolumes(b, pvcNames)
 
 	// Unlock stale locks, backup with lock retry; retention must not fail a successful backup.
 	script := "restic unlock || true; restic snapshots >/dev/null 2>&1 || restic init; restic backup --retry-lock 5m " + strings.Join(shellQuote(paths), " ")

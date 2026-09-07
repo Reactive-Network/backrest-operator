@@ -58,6 +58,7 @@ type PVCBackupRetention struct {
 type PVCBackupStatus struct {
 	Phase                string      `json:"phase,omitempty"`
 	LastBackupTime       string      `json:"lastBackupTime,omitempty"`
+	LastSuccessTime      string      `json:"lastSuccessTime,omitempty"`
 	LastSnapshotName     string      `json:"lastSnapshotName,omitempty"`
 	LastResticSnapshotID string      `json:"lastResticSnapshotID,omitempty"`
 	LastJobName          string      `json:"lastJobName,omitempty"`

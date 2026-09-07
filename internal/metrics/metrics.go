@@ -2,9 +2,13 @@ package metrics
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
+
+	operatorv1alpha1 "github.com/Reactive-Network/backrest-operator/api/v1alpha1"
 )
 
 var (
@@ -59,11 +63,34 @@ func init() {
 	)
 }
 
+// SyncBackupLastSuccess sets both last-success gauges without incrementing counters.
+func SyncBackupLastSuccess(namespace, name string, unixTs float64) {
+	BackupLastSuccess.WithLabelValues(namespace, name).Set(unixTs)
+	BackupLastSuccessSeconds.WithLabelValues(namespace, name).Set(unixTs)
+}
+
+// LastSuccessUnixFromStatus derives the unix timestamp for gauge seed/sync from CR status.
+func LastSuccessUnixFromStatus(status operatorv1alpha1.PVCBackupStatus) float64 {
+	if status.LastSuccessTime != "" {
+		if t, err := time.Parse(time.RFC3339, status.LastSuccessTime); err == nil {
+			return float64(t.Unix())
+		}
+	}
+	if status.Phase == "Succeeded" || status.Phase == "Scheduled" {
+		if status.LastBackupTime != "" {
+			if t, err := time.Parse(time.RFC3339, status.LastBackupTime); err == nil {
+				return float64(t.Unix())
+			}
+			return 0
+		}
+	}
+	return 0
+}
+
 // ObserveBackupSuccess updates success metrics used by SLA alerts.
 func ObserveBackupSuccess(namespace, name string, unixTs float64) {
 	BackupTotal.WithLabelValues(namespace, name, "success").Inc()
-	BackupLastSuccess.WithLabelValues(namespace, name).Set(unixTs)
-	BackupLastSuccessSeconds.WithLabelValues(namespace, name).Set(unixTs)
+	SyncBackupLastSuccess(namespace, name, unixTs)
 }
 
 // ObserveBackupFailure increments failure counters used by BackrestBackupFailed.
@@ -75,6 +102,15 @@ func ObserveBackupFailure(namespace, name string) {
 // ObserveRestoreFailure increments restore failure counters.
 func ObserveRestoreFailure(namespace, name string) {
 	RestoreFailedTotal.WithLabelValues(namespace, name).Inc()
+}
+
+// gaugeValue reads the current value of a GaugeVec label set (for tests).
+func gaugeValue(g *prometheus.GaugeVec, namespace, name string) (float64, bool) {
+	metric := &dto.Metric{}
+	if err := g.WithLabelValues(namespace, name).Write(metric); err != nil {
+		return 0, false
+	}
+	return metric.GetGauge().GetValue(), true
 }
 
 // StartServer serves /metrics on addr (e.g. :8080).

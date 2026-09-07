@@ -203,6 +203,9 @@ spec:
                 lastBackupTime:
                   type: string
                   format: date-time
+                lastSuccessTime:
+                  type: string
+                  format: date-time
                 lastSnapshotName:
                   type: string
                 lastResticSnapshotID:
