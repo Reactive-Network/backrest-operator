@@ -161,7 +161,6 @@ jobs:
   - name: deploy-ci
     serial_groups: [deploy]
     max_in_flight: 1
-    timeout: 30m
     plan:
       - in_parallel:
           steps:
@@ -172,6 +171,7 @@ jobs:
               passed: [set-self]
             - get: deployer-image
       - task: deploy
+        timeout: 30m
         image: deployer-image
         file: app-git/concourse/tasks/backrest-deploy.yml
         input_mapping:
