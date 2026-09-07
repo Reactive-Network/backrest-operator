@@ -65,6 +65,9 @@ resources:
       username: ((ghcr-credentials.username))
       password: ((ghcr-credentials.password))
 
+serial_groups:
+  - deploy
+
 groups:
   - name: meta
     jobs:
@@ -74,6 +77,7 @@ groups:
       - unit-test
       - helm-lint
       - build-images
+      - deploy-ci
   - name: release-flow
     jobs:
       - release
@@ -153,6 +157,28 @@ jobs:
           GHCR_PASSWORD: ((ghcr-credentials.password))
           GHCR_OWNER: reactive-network
           GIT_BRANCH: master
+
+  - name: deploy-ci
+    serial_groups: [deploy]
+    max_in_flight: 1
+    timeout: 30m
+    plan:
+      - in_parallel:
+          steps:
+            - get: app-git
+              passed: [build-images]
+              trigger: true
+            - get: ci-shared
+              passed: [set-self]
+            - get: deployer-image
+      - task: deploy
+        image: deployer-image
+        file: app-git/concourse/tasks/backrest-deploy.yml
+        input_mapping:
+          app-git: app-git
+        params:
+          DEPLOY_SOURCE: ci
+          KUBECONFIG_CONTENT: ((kubeconfig-prq))
 
   - name: release
     plan:

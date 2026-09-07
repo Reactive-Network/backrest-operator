@@ -6,7 +6,7 @@ git config --global --add safe.directory "$(pwd)" 2>/dev/null || true
 
 OWNER="${GHCR_OWNER:-reactive-network}"
 OWNER="$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')"
-SHA_SHORT="$(git rev-parse --short=7 HEAD)"
+SHA_SHORT="$(git rev-parse HEAD | cut -c1-12)"
 if [ -n "${RELEASE_VERSION:-}" ]; then
   REF="${RELEASE_VERSION}"
 elif tag="$(git describe --tags --exact-match 2>/dev/null)"; then

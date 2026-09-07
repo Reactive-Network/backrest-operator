@@ -1,0 +1,19 @@
+---
+platform: linux
+
+inputs:
+  - name: app-git
+
+params:
+  DEPLOY_SOURCE: ""
+  IMAGE_TAG: ""
+  KUBECONFIG_CONTENT: ""
+  HELM_RELEASE: backrest-operator
+  NAMESPACE: backrest
+  CHART_PATH: charts/backrest-operator
+
+run:
+  path: bash
+  args:
+    - concourse/scripts/backrest-deploy.sh
+  dir: app-git
