@@ -197,6 +197,7 @@ spec:
                     - Quiescing
                     - Snapshotting
                     - Uploading
+                    - Pruning
                     - Unquiescing
                     - Succeeded
                     - Failed
@@ -216,6 +217,8 @@ spec:
                   type: integer
                   format: int32
                 lastForceRun:
+                  type: string
+                lastForcePrune:
                   type: string
                 conditions:
                   type: array

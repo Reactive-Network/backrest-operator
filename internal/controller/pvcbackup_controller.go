@@ -29,6 +29,7 @@ import (
 
 const (
 	annForceRun       = "operator.backrest.io/force-run"
+	annForcePrune     = "operator.backrest.io/force-prune"
 	annQuiesceState   = "operator.backrest.io/quiesce-state"
 	finalizerHostPlan = "operator.backrest.io/host-plan"
 
@@ -84,12 +85,77 @@ func (r *PVCBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// Drop kubectl-annotate CronJob scaffolding from older operator versions.
 	_ = r.cleanupLegacyScheduleResources(ctx, &backup)
 
-	// Resume watching an in-flight Job without re-quiescing.
+	// Resume watching an in-flight backup Job without re-quiescing.
 	// One Job per PVC session; a restore to the same disk may interrupt us via fail().
 	if backup.Status.Phase == "Uploading" && backup.Status.LastJobName != "" {
 		return r.pollBackupJob(ctx, &backup)
 	}
-	if backup.Status.Phase == "Failed" && !forceRunPending(&backup) && backup.Spec.Schedule == "" {
+
+	// Resume watching an in-flight prune-only Job (no quiesce, no PVC mount).
+	if backup.Status.Phase == "Pruning" && backup.Status.LastJobName != "" {
+		return r.pollPruneJob(ctx, &backup)
+	}
+
+	// Start force-prune before backup/schedule paths.
+	if forcePrunePending(&backup) {
+		if backupPhaseInFlight(backup.Status.Phase) {
+			logger.V(1).Info("backup in-flight; deferring force-prune", "phase", backup.Status.Phase)
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		if backup.Spec.Retention.KeepLast == nil || *backup.Spec.Retention.KeepLast <= 0 {
+			if force := backup.Annotations[annForcePrune]; force != "" {
+				backup.Status.LastForcePrune = force
+				_ = r.Status().Update(ctx, &backup)
+			}
+			return r.failPrune(ctx, &backup, fmt.Errorf("spec.retention.keepLast required for prune (must be > 0)"))
+		}
+		if force := backup.Annotations[annForcePrune]; force != "" {
+			backup.Status.LastForcePrune = force
+		}
+		backup.Status.Phase = "Pruning"
+		if err := r.Status().Update(ctx, &backup); err != nil {
+			return ctrl.Result{}, err
+		}
+		repoNS := backup.Spec.RepositoryRef.Namespace
+		if repoNS == "" {
+			repoNS = backup.Namespace
+		}
+		var repo operatorv1alpha1.BackupRepository
+		if err := r.Get(ctx, types.NamespacedName{Name: backup.Spec.RepositoryRef.Name, Namespace: repoNS}, &repo); err != nil {
+			return r.failPrune(ctx, &backup, err)
+		}
+		if err := r.ensureRepoSecrets(ctx, &backup, &repo); err != nil {
+			return r.failPrune(ctx, &backup, err)
+		}
+		started := time.Now()
+		jobName := fmt.Sprintf("pvcbackup-prune-%s-%d", backup.Name, started.Unix())
+		if len(jobName) > 63 {
+			jobName = jobName[:63]
+		}
+		logger.Info("creating restic prune job", "job", jobName, "keepLast", *backup.Spec.Retention.KeepLast)
+		if err := r.createResticPruneJob(ctx, &backup, &repo, jobName); err != nil {
+			return r.failPrune(ctx, &backup, err)
+		}
+		backup.Status.LastJobName = jobName
+		if err := r.Status().Update(ctx, &backup); err != nil {
+			logger.Error(err, "status update after prune job create; will requeue to poll existing job")
+			return ctrl.Result{Requeue: true}, nil
+		}
+		return r.pollPruneJob(ctx, &backup)
+	}
+
+	// Recover from status conflicts: an owned prune Job may exist without Phase=Pruning.
+	if jobName, ok := r.findOwnedPruneJob(ctx, &backup); ok {
+		logger.Info("adopting existing prune job", "job", jobName)
+		backup.Status.Phase = "Pruning"
+		backup.Status.LastJobName = jobName
+		if err := r.Status().Update(ctx, &backup); err != nil {
+			return ctrl.Result{Requeue: true}, nil
+		}
+		return r.pollPruneJob(ctx, &backup)
+	}
+
+	if backup.Status.Phase == "Failed" && !forceRunPending(&backup) && !forcePrunePending(&backup) && backup.Spec.Schedule == "" {
 		return ctrl.Result{}, nil
 	}
 	// Recover from status conflicts: an owned Job may already exist without Phase=Uploading.
@@ -101,6 +167,14 @@ func (r *PVCBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			return ctrl.Result{Requeue: true}, nil
 		}
 		return r.pollBackupJob(ctx, &backup)
+	}
+
+	// Do not start backup while prune is pending or in-flight.
+	if backup.Status.Phase == "Pruning" || forcePrunePending(&backup) {
+		if backup.Status.Phase == "Pruning" && backup.Status.LastJobName != "" {
+			return r.pollPruneJob(ctx, &backup)
+		}
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
 	if backup.Spec.Schedule != "" {
@@ -334,6 +408,79 @@ func (r *PVCBackupReconciler) pollBackupJob(ctx context.Context, backup *operato
 	return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 }
 
+func (r *PVCBackupReconciler) pollPruneJob(ctx context.Context, backup *operatorv1alpha1.PVCBackup) (ctrl.Result, error) {
+	logger := log.FromContext(ctx).WithValues("pvcbackup", client.ObjectKeyFromObject(backup), "job", backup.Status.LastJobName)
+	jobName := backup.Status.LastJobName
+	var job batchv1.Job
+	if err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: backup.Namespace}, &job); err != nil {
+		return r.failPrune(ctx, backup, fmt.Errorf("restic prune job %s: %w", jobName, err))
+	}
+	if job.Status.Succeeded > 0 {
+		logger.Info("restic prune job succeeded")
+		backup.Status.Phase = idlePhaseAfterPrune(backup)
+		backup.Status.LastJobName = jobName
+
+		repoNS := backup.Spec.RepositoryRef.Namespace
+		if repoNS == "" {
+			repoNS = backup.Namespace
+		}
+		var repo operatorv1alpha1.BackupRepository
+		if err := r.Get(ctx, types.NamespacedName{Name: backup.Spec.RepositoryRef.Name, Namespace: repoNS}, &repo); err == nil {
+			if err := syncPVCBackupPlanToHost(ctx, r.Client, backup, &repo); err != nil {
+				logger.Error(err, "sync plan/index to Backrest host after prune")
+			}
+		}
+
+		if err := r.Status().Update(ctx, backup); err != nil {
+			return ctrl.Result{}, err
+		}
+		if backup.Spec.Schedule != "" {
+			_, wait, err := scheduleDue(backup)
+			if err == nil && wait > 0 {
+				return ctrl.Result{RequeueAfter: wait}, nil
+			}
+			return ctrl.Result{RequeueAfter: time.Hour}, nil
+		}
+		return ctrl.Result{}, nil
+	}
+	if job.Status.Failed > 0 {
+		logger.Info("restic prune job failed")
+		return r.failPrune(ctx, backup, fmt.Errorf("restic prune job failed"))
+	}
+	logger.V(1).Info("restic prune job still running")
+	return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+}
+
+func (r *PVCBackupReconciler) failPrune(ctx context.Context, b *operatorv1alpha1.PVCBackup, err error) (ctrl.Result, error) {
+	logger := log.FromContext(ctx).WithValues("pvcbackup", client.ObjectKeyFromObject(b))
+	var cur operatorv1alpha1.PVCBackup
+	if gerr := r.Get(ctx, types.NamespacedName{Name: b.Name, Namespace: b.Namespace}, &cur); gerr == nil && cur.Status.Phase == "Failed" {
+		*b = cur
+		if b.Spec.Schedule != "" {
+			_, wait, serr := scheduleDue(b)
+			if serr == nil && wait > 0 {
+				return ctrl.Result{RequeueAfter: wait}, nil
+			}
+			return ctrl.Result{RequeueAfter: time.Hour}, nil
+		}
+		return ctrl.Result{}, nil
+	}
+
+	logger.Error(err, "prune failed")
+	metrics.ReconcileErrors.WithLabelValues("PVCBackup").Inc()
+	b.Status.Phase = "Failed"
+	b.Status.Conditions = []operatorv1alpha1.Condition{{Type: "Failed", Status: "True", Message: err.Error()}}
+	_ = r.Status().Update(ctx, b)
+	if b.Spec.Schedule != "" {
+		_, wait, serr := scheduleDue(b)
+		if serr == nil && wait > 0 {
+			return ctrl.Result{RequeueAfter: wait}, nil
+		}
+		return ctrl.Result{RequeueAfter: time.Hour}, nil
+	}
+	return ctrl.Result{}, nil
+}
+
 func (r *PVCBackupReconciler) persistQuiesceState(ctx context.Context, b *operatorv1alpha1.PVCBackup, state map[string]int32) error {
 	if len(state) == 0 {
 		return nil
@@ -402,6 +549,35 @@ func pvcList(b *operatorv1alpha1.PVCBackup) []string {
 func forceRunPending(b *operatorv1alpha1.PVCBackup) bool {
 	force := b.Annotations[annForceRun]
 	return force != "" && force != b.Status.LastForceRun
+}
+
+func forcePrunePending(b *operatorv1alpha1.PVCBackup) bool {
+	force := b.Annotations[annForcePrune]
+	return force != "" && force != b.Status.LastForcePrune
+}
+
+func backupPhaseInFlight(phase string) bool {
+	switch phase {
+	case "Pending", "Quiescing", "Snapshotting", "Uploading":
+		return true
+	default:
+		return false
+	}
+}
+
+func idlePhaseAfterPrune(b *operatorv1alpha1.PVCBackup) string {
+	if b.Spec.Schedule != "" {
+		return "Scheduled"
+	}
+	return "Succeeded"
+}
+
+func pruneJobScript(b *operatorv1alpha1.PVCBackup) string {
+	planID := planIDForPVCBackup(b)
+	planTag := backrest.PlanTag(planID)
+	keepLast := *b.Spec.Retention.KeepLast
+	return fmt.Sprintf("restic unlock || true; restic forget --retry-lock 5m --group-by tags --tag %s --keep-last %d --prune || true",
+		shellQuoteOne(planTag), keepLast)
 }
 
 func scheduleDue(b *operatorv1alpha1.PVCBackup) (due bool, wait time.Duration, err error) {
@@ -545,6 +721,37 @@ func (r *PVCBackupReconciler) findOwnedBackupJob(ctx context.Context, b *operato
 			continue
 		}
 		// Skip finished jobs — only adopt in-flight work.
+		if j.Status.Succeeded > 0 || j.Status.Failed > 0 {
+			continue
+		}
+		ts := j.CreationTimestamp.Unix()
+		if ts >= newestTS {
+			newestTS = ts
+			newest = j.Name
+		}
+	}
+	if newest == "" {
+		return "", false
+	}
+	return newest, true
+}
+
+func (r *PVCBackupReconciler) findOwnedPruneJob(ctx context.Context, b *operatorv1alpha1.PVCBackup) (string, bool) {
+	var jobs batchv1.JobList
+	if err := r.List(ctx, &jobs, client.InNamespace(b.Namespace)); err != nil {
+		return "", false
+	}
+	prefix := "pvcbackup-prune-" + b.Name + "-"
+	var newest string
+	var newestTS int64
+	for i := range jobs.Items {
+		j := &jobs.Items[i]
+		if !strings.HasPrefix(j.Name, prefix) {
+			continue
+		}
+		if !metav1.IsControlledBy(j, b) {
+			continue
+		}
 		if j.Status.Succeeded > 0 || j.Status.Failed > 0 {
 			continue
 		}
@@ -846,6 +1053,54 @@ func (r *PVCBackupReconciler) createResticBackupJob(ctx context.Context, b *oper
 			},
 		},
 	}
+	_ = controllerutil.SetControllerReference(b, job, r.Scheme)
+	err := r.Create(ctx, job)
+	if apierrors.IsAlreadyExists(err) {
+		return nil
+	}
+	return err
+}
+
+func buildResticPruneJob(b *operatorv1alpha1.PVCBackup, repo *operatorv1alpha1.BackupRepository, jobName string) *batchv1.Job {
+	enableLinks := false
+	backoff := jobRetries(b)
+	ttl := int32(86400)
+	if b.Spec.TTLSecondsAfterFinished != nil {
+		ttl = *b.Spec.TTLSecondsAfterFinished
+	}
+
+	cmd := []string{"sh", "-ec", pruneJobScript(b)}
+	env := resticEnv(repo)
+	container := corev1.Container{
+		Name:    "restic",
+		Image:   resticImage,
+		Command: cmd,
+		Env:     env,
+	}
+	if repo.Spec.EnvFromSecretRef != nil && repo.Spec.EnvFromSecretRef.Name != "" {
+		container.EnvFrom = []corev1.EnvFromSource{{SecretRef: &corev1.SecretEnvSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: repo.Spec.EnvFromSecretRef.Name},
+		}}}
+	}
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: b.Namespace},
+		Spec: batchv1.JobSpec{
+			BackoffLimit:            &backoff,
+			TTLSecondsAfterFinished: &ttl,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					RestartPolicy:      corev1.RestartPolicyNever,
+					EnableServiceLinks: &enableLinks,
+					NodeSelector:       b.Spec.NodeSelector,
+					Containers:         []corev1.Container{container},
+				},
+			},
+		},
+	}
+}
+
+func (r *PVCBackupReconciler) createResticPruneJob(ctx context.Context, b *operatorv1alpha1.PVCBackup, repo *operatorv1alpha1.BackupRepository, jobName string) error {
+	job := buildResticPruneJob(b, repo, jobName)
 	_ = controllerutil.SetControllerReference(b, job, r.Scheme)
 	err := r.Create(ctx, job)
 	if apierrors.IsAlreadyExists(err) {
