@@ -82,7 +82,7 @@ func TestBuildResticPruneJobNoPVCMounts(t *testing.T) {
 		t.Fatalf("expected no volume mounts, got %d", len(c.VolumeMounts))
 	}
 	script := strings.Join(c.Command, " ")
-	for _, want := range []string{"forget", "--prune", "--keep-last 5", "--group-by tags"} {
+	for _, want := range []string{"forget", "--prune", "--keep-last 5", "--group-by ''"} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("script missing %q: %s", want, script)
 		}

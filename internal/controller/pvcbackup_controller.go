@@ -573,11 +573,13 @@ func idlePhaseAfterPrune(b *operatorv1alpha1.PVCBackup) string {
 }
 
 func pruneJobScript(b *operatorv1alpha1.PVCBackup) string {
-	planID := planIDForPVCBackup(b)
-	planTag := backrest.PlanTag(planID)
 	keepLast := *b.Spec.Retention.KeepLast
-	return fmt.Sprintf("restic unlock || true; restic forget --retry-lock 5m --group-by tags --tag %s --keep-last %d --prune || true",
-		shellQuoteOne(planTag), keepLast)
+	// Repo-wide retention: backup Jobs use unique pod hostnames, so default
+	// host grouping never expires anything. Empty --group-by keeps the newest
+	// N snapshots in the whole repository (including leftover plans from
+	// previous selected nodes). Plan-scoped --tag forget left those orphans.
+	return fmt.Sprintf("restic unlock || true; restic forget --retry-lock 5m --group-by '' --keep-last %d --prune || true",
+		keepLast)
 }
 
 func scheduleDue(b *operatorv1alpha1.PVCBackup) (due bool, wait time.Duration, err error) {
@@ -1019,8 +1021,9 @@ func (r *PVCBackupReconciler) createResticBackupJob(ctx context.Context, b *oper
 	script += " --tag " + shellQuoteOne(backrest.PlanTag(planID))
 	script += " --tag " + shellQuoteOne(backrest.InstanceTag(instance))
 	if b.Spec.Retention.KeepLast != nil {
-		// Group by tags only: Job pods use unique hostnames, so default host grouping would keep everything.
-		script += fmt.Sprintf("; restic forget --retry-lock 5m --group-by tags --tag %s --keep-last %d --prune || true", shellQuoteOne(backrest.PlanTag(planID)), *b.Spec.Retention.KeepLast)
+		// Empty --group-by: Job pods use unique hostnames, so host grouping would keep everything;
+		// plan-scoped tags leave orphans after backup selection flips between nodes.
+		script += fmt.Sprintf("; restic forget --retry-lock 5m --group-by '' --keep-last %d --prune || true", *b.Spec.Retention.KeepLast)
 	}
 	cmd := []string{"sh", "-ec", script}
 
