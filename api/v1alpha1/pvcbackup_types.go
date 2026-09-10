@@ -65,6 +65,7 @@ type PVCBackupStatus struct {
 	LastDurationSeconds  int64       `json:"lastDurationSeconds,omitempty"`
 	LastForceRun         string      `json:"lastForceRun,omitempty"`
 	LastForcePrune       string      `json:"lastForcePrune,omitempty"`
+	LastForceCancel      string      `json:"lastForceCancel,omitempty"`
 	Conditions           []Condition `json:"conditions,omitempty"`
 }
 

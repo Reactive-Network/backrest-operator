@@ -30,6 +30,7 @@ import (
 const (
 	annForceRun       = "operator.backrest.io/force-run"
 	annForcePrune     = "operator.backrest.io/force-prune"
+	annForceCancel    = "operator.backrest.io/force-cancel"
 	annQuiesceState   = "operator.backrest.io/quiesce-state"
 	finalizerHostPlan = "operator.backrest.io/host-plan"
 
@@ -84,6 +85,11 @@ func (r *PVCBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	// Drop kubectl-annotate CronJob scaffolding from older operator versions.
 	_ = r.cleanupLegacyScheduleResources(ctx, &backup)
+
+	// Cancel before resume polls so Uploading/Pruning Jobs can be aborted.
+	if forceCancelPending(&backup) {
+		return r.handleForceCancel(ctx, &backup)
+	}
 
 	// Resume watching an in-flight backup Job without re-quiescing.
 	// One Job per PVC session; a restore to the same disk may interrupt us via fail().
@@ -155,7 +161,7 @@ func (r *PVCBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return r.pollPruneJob(ctx, &backup)
 	}
 
-	if backup.Status.Phase == "Failed" && !forceRunPending(&backup) && !forcePrunePending(&backup) && backup.Spec.Schedule == "" {
+	if backup.Status.Phase == "Failed" && !forceRunPending(&backup) && !forcePrunePending(&backup) && !forceCancelPending(&backup) && backup.Spec.Schedule == "" {
 		return ctrl.Result{}, nil
 	}
 	// Recover from status conflicts: an owned Job may already exist without Phase=Uploading.
@@ -556,6 +562,20 @@ func forcePrunePending(b *operatorv1alpha1.PVCBackup) bool {
 	return force != "" && force != b.Status.LastForcePrune
 }
 
+func forceCancelPending(b *operatorv1alpha1.PVCBackup) bool {
+	force := b.Annotations[annForceCancel]
+	return force != "" && force != b.Status.LastForceCancel
+}
+
+func cancelPhaseBusy(phase string) bool {
+	switch phase {
+	case "Pending", "Quiescing", "Snapshotting", "Uploading", "Pruning":
+		return true
+	default:
+		return false
+	}
+}
+
 func backupPhaseInFlight(phase string) bool {
 	switch phase {
 	case "Pending", "Quiescing", "Snapshotting", "Uploading":
@@ -563,6 +583,36 @@ func backupPhaseInFlight(phase string) bool {
 	default:
 		return false
 	}
+}
+
+// handleForceCancel aborts an in-flight backup/prune Job and restores quiesced workloads.
+func (r *PVCBackupReconciler) handleForceCancel(ctx context.Context, backup *operatorv1alpha1.PVCBackup) (ctrl.Result, error) {
+	logger := log.FromContext(ctx).WithValues("pvcbackup", client.ObjectKeyFromObject(backup))
+	force := backup.Annotations[annForceCancel]
+	backup.Status.LastForceCancel = force
+
+	if jobName := backup.Status.LastJobName; jobName != "" {
+		logger.Info("cancelling restic job", "job", jobName, "phase", backup.Status.Phase)
+		prop := metav1.DeletePropagationBackground
+		err := r.Delete(ctx, &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: backup.Namespace},
+		}, &client.DeleteOptions{PropagationPolicy: &prop})
+		if err != nil && !apierrors.IsNotFound(err) {
+			logger.Error(err, "delete job on cancel")
+		}
+	}
+
+	if !cancelPhaseBusy(backup.Status.Phase) {
+		if err := r.Status().Update(ctx, backup); err != nil {
+			return ctrl.Result{Requeue: true}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	if backup.Status.Phase == "Pruning" {
+		return r.failPrune(ctx, backup, fmt.Errorf("cancelled by user"))
+	}
+	return r.fail(ctx, backup, fmt.Errorf("cancelled by user"))
 }
 
 func idlePhaseAfterPrune(b *operatorv1alpha1.PVCBackup) string {
