@@ -203,10 +203,7 @@ func (r *PVCRestoreReconciler) startResticRestore(ctx context.Context, restore *
 	if err := r.ensureRestoreRepoSecrets(ctx, restore, &repo, repoNS); err != nil {
 		return r.fail(ctx, restore, err)
 	}
-	cmd := []string{"sh", "-ec", "restic unlock || true; restic restore --retry-lock 5m " + snap + " --target /data"}
-	for _, p := range restore.Spec.Restic.PathFilters {
-		cmd[2] += " --include " + shellQuoteOne(p)
-	}
+	cmd := []string{"sh", "-ec", resticRestoreJobScript(snap, restore.Spec.Restic.PathFilters)}
 	jobName := fmt.Sprintf("pvcrestore-%s-%d", restore.Name, time.Now().Unix())
 	if len(jobName) > 63 {
 		jobName = jobName[:63]

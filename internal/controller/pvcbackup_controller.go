@@ -22,7 +22,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	operatorv1alpha1 "github.com/Reactive-Network/backrest-operator/api/v1alpha1"
-	"github.com/Reactive-Network/backrest-operator/internal/backrest"
 	"github.com/Reactive-Network/backrest-operator/internal/filters"
 	"github.com/Reactive-Network/backrest-operator/internal/metrics"
 )
@@ -622,16 +621,6 @@ func idlePhaseAfterPrune(b *operatorv1alpha1.PVCBackup) string {
 	return "Succeeded"
 }
 
-func pruneJobScript(b *operatorv1alpha1.PVCBackup) string {
-	keepLast := *b.Spec.Retention.KeepLast
-	// Repo-wide retention: backup Jobs use unique pod hostnames, so default
-	// host grouping never expires anything. Empty --group-by keeps the newest
-	// N snapshots in the whole repository (including leftover plans from
-	// previous selected nodes). Plan-scoped --tag forget left those orphans.
-	return fmt.Sprintf("restic unlock || true; restic forget --retry-lock 5m --group-by '' --keep-last %d --prune || true",
-		keepLast)
-}
-
 func scheduleDue(b *operatorv1alpha1.PVCBackup) (due bool, wait time.Duration, err error) {
 	if forceRunPending(b) {
 		return true, 0, nil
@@ -1048,33 +1037,22 @@ func (r *PVCBackupReconciler) createResticBackupJob(ctx context.Context, b *oper
 
 	vols, mounts, paths := buildResticBackupJobVolumes(b, pvcNames)
 
-	// Unlock stale locks, backup with lock retry; retention must not fail a successful backup.
-	script := "restic unlock || true; restic snapshots >/dev/null 2>&1 || restic init; restic backup --retry-lock 5m " + strings.Join(shellQuote(paths), " ")
-	for _, ex := range b.Spec.Excludes {
-		script += " --exclude " + shellQuoteOne(ex)
-	}
 	// Tag so Backrest UI associates snapshots with the synced plan/instance.
 	planID := planIDForPVCBackup(b)
 	instance := "main"
 	if b.Spec.RepositoryRef.Namespace != "" || b.Spec.RepositoryRef.Name != "" {
 		// Prefer BackrestCluster name from repo sync target when available at Job create time.
-		var repo operatorv1alpha1.BackupRepository
+		var repoCR operatorv1alpha1.BackupRepository
 		repoNS := b.Spec.RepositoryRef.Namespace
 		if repoNS == "" {
 			repoNS = b.Namespace
 		}
-		if err := r.Get(ctx, types.NamespacedName{Name: b.Spec.RepositoryRef.Name, Namespace: repoNS}, &repo); err == nil {
-			_, clusterName := resolveClusterRef(repo.Spec.Backrest.ClusterRef, repo.Namespace)
+		if err := r.Get(ctx, types.NamespacedName{Name: b.Spec.RepositoryRef.Name, Namespace: repoNS}, &repoCR); err == nil {
+			_, clusterName := resolveClusterRef(repoCR.Spec.Backrest.ClusterRef, repoCR.Namespace)
 			instance = instanceForCluster(clusterName)
 		}
 	}
-	script += " --tag " + shellQuoteOne(backrest.PlanTag(planID))
-	script += " --tag " + shellQuoteOne(backrest.InstanceTag(instance))
-	if b.Spec.Retention.KeepLast != nil {
-		// Empty --group-by: Job pods use unique hostnames, so host grouping would keep everything;
-		// plan-scoped tags leave orphans after backup selection flips between nodes.
-		script += fmt.Sprintf("; restic forget --retry-lock 5m --group-by '' --keep-last %d --prune || true", *b.Spec.Retention.KeepLast)
-	}
+	script := resticBackupJobScript(paths, b.Spec.Excludes, planID, instance, b.Spec.Retention.KeepLast)
 	cmd := []string{"sh", "-ec", script}
 
 	env := resticEnv(repo)
