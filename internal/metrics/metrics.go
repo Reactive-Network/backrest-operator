@@ -1,12 +1,11 @@
 package metrics
 
 import (
-	"net/http"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	dto "github.com/prometheus/client_model/go"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	operatorv1alpha1 "github.com/Reactive-Network/backrest-operator/api/v1alpha1"
 )
@@ -51,8 +50,15 @@ var (
 	}, []string{"kind"})
 )
 
+// Register into controller-runtime's registry, not prometheus.DefaultRegisterer.
+// The operator's only /metrics endpoint is the one controller-runtime serves
+// (metricsserver.Options{BindAddress} in cmd/operator/main.go), and that endpoint
+// gathers exclusively from crmetrics.Registry. Registering into the default registry
+// meant every backrest_* series was collected in-process and never exposed: the scrape
+// target was up and returning controller_runtime_* and go_*, so nothing looked broken,
+// while alerts keyed on backrest_backup_last_success_timestamp_seconds could never fire.
 func init() {
-	prometheus.MustRegister(
+	crmetrics.Registry.MustRegister(
 		BackupFailedTotal,
 		BackupLastSuccessSeconds,
 		RestoreFailedTotal,
@@ -113,11 +119,7 @@ func gaugeValue(g *prometheus.GaugeVec, namespace, name string) (float64, bool) 
 	return metric.GetGauge().GetValue(), true
 }
 
-// StartServer serves /metrics on addr (e.g. :8080).
-func StartServer(addr string) {
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.Handler())
-	go func() {
-		_ = http.ListenAndServe(addr, mux)
-	}()
-}
+// StartServer is gone: it had no callers and served promhttp.Handler(), i.e. the
+// default registry, which is exactly the endpoint/registry mismatch that kept
+// backrest_* metrics invisible. The operator's metrics come from controller-runtime's
+// server; there is no second endpoint to start.

@@ -4,7 +4,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	operatorv1alpha1 "github.com/Reactive-Network/backrest-operator/api/v1alpha1"
 )
@@ -150,4 +152,53 @@ func mustParseRFC3339(t *testing.T, s string) time.Time {
 		t.Fatalf("parse RFC3339 %q: %v", s, err)
 	}
 	return parsed
+}
+
+// TestAlertMetricsAreExposedByControllerRuntimeRegistry pins the registry the metrics
+// land in. The operator serves /metrics only from controller-runtime's metrics server,
+// which gathers exclusively from crmetrics.Registry; these metrics used to be
+// registered into prometheus.DefaultRegisterer instead, so they were collected
+// in-process and never scraped. Nothing looked broken -- the scrape target stayed up
+// and served controller_runtime_* and go_* -- while every alert keyed on a backrest_*
+// series sat silently at "no data" for months.
+func TestAlertMetricsAreExposedByControllerRuntimeRegistry(t *testing.T) {
+	// Registering an already-registered collector returns AlreadyRegisteredError, which
+	// is a direct assertion of membership. A Gather would miss *Vec collectors that have
+	// no child series yet (an untouched HistogramVec reports no family at all), so it
+	// cannot tell "registered elsewhere" from "registered here but unused".
+	collectors := map[string]prometheus.Collector{
+		"backrest_backup_last_success_timestamp_seconds":  BackupLastSuccessSeconds,
+		"backrest_backup_failed_total":                    BackupFailedTotal,
+		"backrest_restore_failed_total":                   RestoreFailedTotal,
+		"backrest_operator_backup_total":                  BackupTotal,
+		"backrest_operator_backup_duration_seconds":       BackupDuration,
+		"backrest_operator_backup_last_success_timestamp": BackupLastSuccess,
+		"backrest_operator_reconcile_errors_total":        ReconcileErrors,
+	}
+	for name, c := range collectors {
+		err := crmetrics.Registry.Register(c)
+		if err == nil {
+			// It was not in there: we just added it, so undo and fail.
+			crmetrics.Registry.Unregister(c)
+			t.Errorf("%s is not registered with the scraped registry; alerts on it can never fire", name)
+			continue
+		}
+		if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
+			t.Errorf("%s: unexpected register error: %v", name, err)
+		}
+	}
+
+	// End-to-end for the metric the backup SLA alert reads: set a series and confirm it
+	// comes out of the endpoint's registry.
+	SyncBackupLastSuccess("gather-ns", "gather-backup", 1700000000)
+	families, err := crmetrics.Registry.Gather()
+	if err != nil {
+		t.Fatalf("gather from controller-runtime registry: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() == "backrest_backup_last_success_timestamp_seconds" {
+			return
+		}
+	}
+	t.Fatal("backrest_backup_last_success_timestamp_seconds missing from gather; CatalystNetworkBackupStale cannot fire")
 }
