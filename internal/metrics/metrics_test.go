@@ -132,6 +132,42 @@ func TestObserveBackupSuccessStillIncrementsCounters(t *testing.T) {
 	}
 }
 
+func TestForgetBackupDropsOnlyThatBackupsSeries(t *testing.T) {
+	const ns, gone, kept = "forget-ns", "gone-backup", "kept-backup"
+	SyncBackupLastSuccess(ns, gone, 0)
+	ObserveBackupFailure(ns, gone)
+	BackupDuration.WithLabelValues(ns, gone).Observe(60)
+	SyncBackupLastSuccess(ns, kept, 1700000000)
+
+	ForgetBackup(ns, gone)
+
+	families, err := crmetrics.Registry.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	keptSeen := false
+	for _, f := range families {
+		for _, m := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, l := range m.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			if labels["namespace"] != ns {
+				continue
+			}
+			switch labels["name"] {
+			case gone:
+				t.Errorf("%s still exports a series for the forgotten backup", f.GetName())
+			case kept:
+				keptSeen = true
+			}
+		}
+	}
+	if !keptSeen {
+		t.Fatal("ForgetBackup removed series of an unrelated backup")
+	}
+}
+
 func counterValue(t *testing.T, c prometheusCounter) float64 {
 	t.Helper()
 	m := &dto.Metric{}

@@ -49,15 +49,21 @@ func (r *PVCBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	logger := log.FromContext(ctx).WithValues("pvcbackup", req.NamespacedName)
 	var backup operatorv1alpha1.PVCBackup
 	if err := r.Get(ctx, req.NamespacedName, &backup); err != nil {
+		if apierrors.IsNotFound(err) {
+			metrics.ForgetBackup(req.Namespace, req.Name)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	if !filters.ObjectAllowed(backup.Namespace, backup.Labels) {
 		logger.V(1).Info("skipped by watch filter")
+		metrics.ForgetBackup(backup.Namespace, backup.Name)
 		return ctrl.Result{}, nil
 	}
-	metrics.SyncBackupLastSuccess(backup.Namespace, backup.Name, metrics.LastSuccessUnixFromStatus(backup.Status))
 
 	if !backup.DeletionTimestamp.IsZero() {
+		// Drop the series now rather than on the NotFound pass: a finalizer that cannot
+		// be removed would otherwise keep a dying backup alerting.
+		metrics.ForgetBackup(backup.Namespace, backup.Name)
 		if controllerutil.ContainsFinalizer(&backup, finalizerHostPlan) {
 			if err := removePVCBackupPlanFromHost(ctx, r.Client, &backup); err != nil {
 				logger.Error(err, "remove host plan on delete")
@@ -70,6 +76,8 @@ func (r *PVCBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 		return ctrl.Result{}, nil
 	}
+	metrics.SyncBackupLastSuccess(backup.Namespace, backup.Name, metrics.LastSuccessUnixFromStatus(backup.Status))
+
 	if !controllerutil.ContainsFinalizer(&backup, finalizerHostPlan) {
 		controllerutil.AddFinalizer(&backup, finalizerHostPlan)
 		if err := r.Update(ctx, &backup); err != nil {

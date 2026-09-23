@@ -99,6 +99,20 @@ func ObserveBackupSuccess(namespace, name string, unixTs float64) {
 	SyncBackupLastSuccess(namespace, name, unixTs)
 }
 
+// ForgetBackup drops every per-PVCBackup series once the CR is gone. Label sets on a
+// *Vec live in process memory until deleted, so without this a deleted PVCBackup kept
+// exporting its last gauge value until the operator restarted: one that never succeeded
+// sat at 0 and fired CatalystNetworkBackupNeverSucceeded, one that had succeeded aged
+// into CatalystNetworkBackupStale, both for disks that no longer exist.
+func ForgetBackup(namespace, name string) {
+	labels := prometheus.Labels{"namespace": namespace, "name": name}
+	BackupFailedTotal.DeletePartialMatch(labels)
+	BackupLastSuccessSeconds.DeletePartialMatch(labels)
+	BackupTotal.DeletePartialMatch(labels)
+	BackupDuration.DeletePartialMatch(labels)
+	BackupLastSuccess.DeletePartialMatch(labels)
+}
+
 // ObserveBackupFailure increments failure counters used by BackrestBackupFailed.
 func ObserveBackupFailure(namespace, name string) {
 	BackupTotal.WithLabelValues(namespace, name, "failure").Inc()
