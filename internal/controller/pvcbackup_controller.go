@@ -367,8 +367,9 @@ func (r *PVCBackupReconciler) pollBackupJob(ctx context.Context, backup *operato
 	logger := log.FromContext(ctx).WithValues("pvcbackup", client.ObjectKeyFromObject(backup), "job", backup.Status.LastJobName)
 	jobName := backup.Status.LastJobName
 	var job batchv1.Job
+	// fail() restores workloads itself; a release here first would clear the
+	// recorded replicas and leave fail() with the 1-replica fallback.
 	if err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: backup.Namespace}, &job); err != nil {
-		_ = r.releaseQuiesce(ctx, backup)
 		return r.fail(ctx, backup, fmt.Errorf("restic job %s: %w", jobName, err))
 	}
 	if job.Status.Succeeded > 0 {
@@ -414,7 +415,6 @@ func (r *PVCBackupReconciler) pollBackupJob(ctx context.Context, backup *operato
 	}
 	if job.Status.Failed > 0 {
 		logger.Info("restic job failed, restoring workloads")
-		_ = r.releaseQuiesce(ctx, backup)
 		return r.fail(ctx, backup, fmt.Errorf("restic job failed"))
 	}
 	logger.V(1).Info("restic job still running")
@@ -502,15 +502,7 @@ func (r *PVCBackupReconciler) persistQuiesceState(ctx context.Context, b *operat
 	if err != nil {
 		return err
 	}
-	var cur operatorv1alpha1.PVCBackup
-	if err := r.Get(ctx, types.NamespacedName{Name: b.Name, Namespace: b.Namespace}, &cur); err != nil {
-		return err
-	}
-	if cur.Annotations == nil {
-		cur.Annotations = map[string]string{}
-	}
-	cur.Annotations[annQuiesceState] = string(raw)
-	return r.Update(ctx, &cur)
+	return r.patchAnnotation(ctx, b, annQuiesceState, string(raw))
 }
 
 func (r *PVCBackupReconciler) releaseQuiesce(ctx context.Context, b *operatorv1alpha1.PVCBackup) error {
@@ -538,15 +530,32 @@ func (r *PVCBackupReconciler) releaseQuiesce(ctx context.Context, b *operatorv1a
 }
 
 func (r *PVCBackupReconciler) clearQuiesceAnnotation(ctx context.Context, b *operatorv1alpha1.PVCBackup) error {
-	var cur operatorv1alpha1.PVCBackup
-	if err := r.Get(ctx, types.NamespacedName{Name: b.Name, Namespace: b.Namespace}, &cur); err != nil {
-		return err
-	}
-	if cur.Annotations == nil || cur.Annotations[annQuiesceState] == "" {
+	if b.Annotations[annQuiesceState] == "" {
 		return nil
 	}
-	delete(cur.Annotations, annQuiesceState)
-	return r.Update(ctx, &cur)
+	return r.patchAnnotation(ctx, b, annQuiesceState, "")
+}
+
+// patchAnnotation sets key (removes it when value is empty) and carries the new
+// metadata back into b. Callers write b's status right after, and with the old
+// resourceVersion that write fails with a conflict. The patch goes through a copy
+// so the server's status does not overwrite b's status that is not written yet.
+func (r *PVCBackupReconciler) patchAnnotation(ctx context.Context, b *operatorv1alpha1.PVCBackup, key, value string) error {
+	obj := b.DeepCopy()
+	base := obj.DeepCopy()
+	if value == "" {
+		delete(obj.Annotations, key)
+	} else {
+		if obj.Annotations == nil {
+			obj.Annotations = map[string]string{}
+		}
+		obj.Annotations[key] = value
+	}
+	if err := r.Patch(ctx, obj, client.MergeFrom(base)); err != nil {
+		return err
+	}
+	b.ObjectMeta = obj.ObjectMeta
+	return nil
 }
 
 func pvcList(b *operatorv1alpha1.PVCBackup) []string {
