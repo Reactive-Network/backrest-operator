@@ -29,14 +29,26 @@ spec:
           annotations:
             summary: Backrest restore failed
             description: A Backrest PVC restore has failed (quiesced workloads are left down on purpose).
+        # The gauge is 0 until the first success, so without the guard every new PVCBackup fired
+        # 15 minutes after creation, hours before its first scheduled run.
         - alert: BackrestBackupNotSucceedingWithinSLA
-          expr: (time() - backrest_backup_last_success_timestamp_seconds) > {{ .Values.monitoring.backupSlaSeconds }}
+          expr: |
+            (time() - backrest_backup_last_success_timestamp_seconds) > {{ .Values.monitoring.backupSlaSeconds }}
+            and backrest_backup_last_success_timestamp_seconds > 0
           for: 15m
           labels:
             severity: warning
           annotations:
             summary: Backrest backup not succeeding within SLA
             description: No successful backup within {{ .Values.monitoring.backupSlaWindow }}.
+        - alert: BackrestBackupNeverSucceeded
+          expr: backrest_backup_last_success_timestamp_seconds == 0
+          for: {{ .Values.monitoring.backupSlaWindow }}
+          labels:
+            severity: warning
+          annotations:
+            summary: Backrest backup has never succeeded
+            description: No successful backup in the {{ .Values.monitoring.backupSlaWindow }} since the PVCBackup appeared.
         - alert: BackrestRepositoryStorageWarning
           expr: backrest_repository_storage_usage_ratio > {{ .Values.monitoring.storageUsageWarningRatio }}
           for: 10m
