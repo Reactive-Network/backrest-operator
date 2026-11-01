@@ -55,6 +55,19 @@ func TestPruneJobScriptIncludesJSON(t *testing.T) {
 	}
 }
 
+func TestResticCheckJobScriptUnlocksAndRetries(t *testing.T) {
+	t.Parallel()
+	script := resticCheckJobScript()
+	for _, want := range []string{
+		"restic unlock || true; restic check --retry-lock 5m && exit 0",
+		"done; exit 1",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("script missing %q\n%s", want, script)
+		}
+	}
+}
+
 func TestResticRestoreJobScriptIncludesJSON(t *testing.T) {
 	t.Parallel()
 	script := resticRestoreJobScript("abcdef", []string{"/data/x"})

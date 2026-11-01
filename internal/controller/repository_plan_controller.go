@@ -92,7 +92,7 @@ func (r *BackupRepositoryReconciler) ensureCheckCron(ctx context.Context, repo *
 	container := corev1.Container{
 		Name:    "restic",
 		Image:   resticImage,
-		Command: []string{"restic", "check"},
+		Command: []string{"sh", "-ec", resticCheckJobScript()},
 		Env:     env,
 	}
 	if repo.Spec.EnvFromSecretRef != nil && repo.Spec.EnvFromSecretRef.Name != "" {

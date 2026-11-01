@@ -56,6 +56,16 @@ func pruneJobScript(b *operatorv1alpha1.PVCBackup) string {
 	return "restic unlock || true; " + resticForgetPruneClause(keepLast)
 }
 
+// resticCheckJobScript builds the shell script for the restic check CronJob.
+// check needs an exclusive lock, and restic only clears locks older than 30 min,
+// so one lock orphaned by a killed restic run (Backrest host API calls leave
+// them) fails it outright. Retry with unlock for longer than that; a real check
+// error fails every attempt and the Job still fails.
+func resticCheckJobScript() string {
+	return "for i in 1 2 3 4 5 6; do restic unlock || true; restic check " + resticRetryLockFlag +
+		" && exit 0; sleep 60; done; exit 1"
+}
+
 func resticRestoreJobScript(snapshotID string, pathFilters []string) string {
 	var b strings.Builder
 	b.WriteString("restic unlock || true; restic restore ")
