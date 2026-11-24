@@ -410,6 +410,13 @@ func (t *Tools) getHostConfig(ctx context.Context, args map[string]interface{}) 
 			cfg.Repos[i].Env = redacted
 		}
 	}
+	if cfg.Auth != nil {
+		for i := range cfg.Auth.Users {
+			if cfg.Auth.Users[i].PasswordBcrypt != "" {
+				cfg.Auth.Users[i].PasswordBcrypt = "***"
+			}
+		}
+	}
 	return cfg, nil
 }
 

@@ -18,18 +18,32 @@ import (
 const defaultTimeout = 120 * time.Second
 
 // Client talks to a Backrest host over ConnectRPC JSON (HTTP POST /v1.Backrest/...).
+// With Credentials set, every request carries HTTP Basic auth; Backrest checks it
+// when its config has auth enabled and ignores it while auth is disabled.
 type Client struct {
-	BaseURL    string
-	HTTPClient *http.Client
+	BaseURL     string
+	HTTPClient  *http.Client
+	Credentials Credentials
 }
 
+// NewClient builds a client with credentials from BACKREST_AUTH_USERNAME /
+// BACKREST_AUTH_PASSWORD when both are set (see CredentialsFromEnv).
 func NewClient(baseURL string) *Client {
 	return &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		HTTPClient: &http.Client{
 			Timeout: defaultTimeout,
 		},
+		Credentials: CredentialsFromEnv(),
 	}
+}
+
+// WithCredentials replaces the client's Basic credentials when cr is complete.
+func (c *Client) WithCredentials(cr Credentials) *Client {
+	if !cr.Empty() {
+		c.Credentials = cr
+	}
+	return c
 }
 
 // HostURL builds the in-cluster Service URL for a BackrestCluster.
@@ -67,7 +81,7 @@ type Config struct {
 	Instance string                 `json:"instance,omitempty"`
 	Repos    []Repo                 `json:"repos,omitempty"`
 	Plans    []Plan                 `json:"plans,omitempty"`
-	Auth     map[string]interface{} `json:"auth,omitempty"`
+	Auth     *Auth                  `json:"auth,omitempty"`
 	Sync     map[string]interface{} `json:"sync,omitempty"`
 }
 
@@ -87,6 +101,9 @@ func (c *Client) post(ctx context.Context, method string, body any, out any) err
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if !c.Credentials.Empty() {
+		req.SetBasicAuth(c.Credentials.Username, c.Credentials.Password)
+	}
 	started := time.Now()
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -129,6 +146,12 @@ func (c *Client) SetConfig(ctx context.Context, cfg *Config) (*Config, error) {
 
 // EnsureInstance sets Config.instance when empty or mismatched.
 func (c *Client) EnsureInstance(ctx context.Context, instance string) error {
+	return c.EnsureHostConfig(ctx, instance, nil)
+}
+
+// EnsureHostConfig sets Config.instance and, when auth is non-nil, the auth block,
+// in a single SetConfig that is skipped when nothing changed.
+func (c *Client) EnsureHostConfig(ctx context.Context, instance string, auth *AuthPolicy) error {
 	if instance == "" {
 		return fmt.Errorf("instance is required")
 	}
@@ -136,10 +159,18 @@ func (c *Client) EnsureInstance(ctx context.Context, instance string) error {
 	if err != nil {
 		return err
 	}
-	if cfg.Instance == instance {
+	changed := false
+	if cfg.Instance != instance {
+		cfg.Instance = instance
+		changed = true
+	}
+	authChanged, err := auth.Apply(cfg)
+	if err != nil {
+		return fmt.Errorf("backrest auth: %w", err)
+	}
+	if !changed && !authChanged {
 		return nil
 	}
-	cfg.Instance = instance
 	_, err = c.SetConfig(ctx, cfg)
 	return err
 }
