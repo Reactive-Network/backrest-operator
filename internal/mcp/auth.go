@@ -145,15 +145,3 @@ func (a *Auth) AuthorizeTool(ctx context.Context, user *UserIdentity, tool, name
 	}
 	return true
 }
-
-// ImpersonateConfig returns a REST config that impersonates the given user.
-func ImpersonateConfig(base *rest.Config, user *UserIdentity) *rest.Config {
-	cfg := rest.CopyConfig(base)
-	cfg.Impersonate = rest.ImpersonationConfig{
-		UserName: user.Username,
-		Groups:   user.Groups,
-		// Omit UID: impersonating uids requires extra RBAC that many clusters
-		// do not grant to the MCP ServiceAccount.
-	}
-	return cfg
-}

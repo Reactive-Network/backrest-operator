@@ -35,12 +35,11 @@ func NewTools(cfg *rest.Config) *Tools {
 	return &Tools{base: cfg}
 }
 
-func (t *Tools) clientFor(user *UserIdentity) (dynamic.Interface, error) {
-	cfg := t.base
-	if user != nil && user.Username != StdioUsername {
-		cfg = ImpersonateConfig(t.base, user)
-	}
-	return dynamic.NewForConfig(cfg)
+// clientFor always uses the pod's own ServiceAccount. The caller was already checked with a
+// SubjectAccessReview in AuthorizeTool; impersonating the caller needed an unrestricted
+// impersonate rule, which is cluster-admin (groups/system:masters).
+func (t *Tools) clientFor(_ *UserIdentity) (dynamic.Interface, error) {
+	return dynamic.NewForConfig(t.base)
 }
 
 func (t *Tools) Call(ctx context.Context, user *UserIdentity, name string, args map[string]interface{}) (interface{}, error) {

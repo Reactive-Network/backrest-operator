@@ -92,10 +92,9 @@ rules:
   - apiGroups: ["authorization.k8s.io"]
     resources: ["subjectaccessreviews", "selfsubjectaccessreviews"]
     verbs: ["create"]
-  - apiGroups: [""]
-    resources: ["users", "groups", "serviceaccounts"]
-    verbs: ["impersonate"]
-  # When MCP_REQUIRE_AUTH=false, tools run as the MCP pod SA (no impersonation).
+  # No impersonate: it had no resourceNames, so this SA could act as groups/system:masters
+  # (cluster-admin). Callers are authorized with a SubjectAccessReview per tool (AuthorizeTool),
+  # then every tool runs as this SA, which only holds the backrest CRs and Jobs below.
   - apiGroups: ["operator.backrest.io"]
     resources:
       - backrestclusters
