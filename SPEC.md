@@ -29,10 +29,10 @@ Users declare **Custom Resources only**. The operator owns derived objects (Depl
 | `BackupPlan` → live Backrest plan sync | **Stub** (writes `ConfigMap/backrest-plans` fragments; host does not mount/apply them yet) |
 | `BackupRepository.backrest.syncToHost` | **Not wired** |
 | `appendOnly` enforcement | **Field only** (not enforced on Jobs/MCP yet) |
-| UI `auth.existingSecret` | **Field only** |
+| `auth.enabled` / `auth.existingSecret` | **Implemented** (Basic auth user written into the host config on every sync; operator and MCP clients authenticate) |
 | `PVCRestore` existing/new | **Partial** (Jobs created; success may be reported before Job completes) |
 | Validating webhooks | **Implemented** (pvcName \| pvcNames) |
-| MCP TokenReview / SAR / impersonation | **Implemented** (tool catalog subset of §6.6) |
+| MCP TokenReview / SAR (tools run as the MCP SA, no impersonation) | **Implemented** (tool catalog subset of §6.6) |
 | Monitoring embeds (ServiceMonitor / VM* / Grafana) | **Implemented** (chart toggles) |
 
 ---
@@ -159,7 +159,7 @@ spec:
         - ReceiveSharedRepos
   auth:
     enabled: false
-    existingSecret: ""                 # keys depend on Backrest auth support
+    existingSecret: ""                 # Secret keys: username, password
   monitoring:
     enabled: true
   mcp:
@@ -450,7 +450,7 @@ Per-user identity — do **not** execute tools solely as the MCP pod SA.
 2. MCP validates with **TokenReview** (MCP SA: `create` on `tokenreviews.authentication.k8s.io`).
 3. Each tool maps to Kubernetes resource attributes on CRs (and related objects).
 4. **SubjectAccessReview** filters `list_tools` and gates `call_tool`.
-5. API calls use **user impersonation** (`Impersonate-User` / groups) so ClusterRoles are the source of truth.
+5. API calls run as the MCP ServiceAccount after the SubjectAccessReview passed (no impersonation: an unrestricted `impersonate` rule is cluster-admin).
 
 **stdio:** use the caller’s kubeconfig; apply the same SAR rules where feasible.
 
@@ -616,7 +616,7 @@ monitoring:
 
 - ClusterRoles: `backrest-viewer`, `backrest-operator`, `backrest-admin`.
 - Operator SA: manage owned CRs, Jobs, VolumeSnapshots, Deployments/DaemonSets for Backrest, Secrets it creates — least privilege.
-- MCP SA: authz APIs + impersonation only.
+- MCP SA: authz APIs, the backrest CRs and Jobs; no impersonation.
 - Repository credentials always in Secrets; document ExternalSecrets/Vault as optional.
 - Append-only repos fail closed on delete/forget.
 

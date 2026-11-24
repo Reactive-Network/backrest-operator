@@ -70,6 +70,7 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- include "backrest-operator.backrestAuthEnv" . | nindent 12 }}
           ports:
             - name: metrics
               containerPort: {{ .Values.operator.metrics.port }}

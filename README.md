@@ -84,7 +84,7 @@ make docker
 - Backup modes: quiesced multi-PVC, CSI/TopoLVM snapshots (single PVC)
 - In-process `PVCBackup` schedules + repository `restic check` CronJobs
 - Restore to existing/new PVC; snapshot download via Backrest GetDownloadURL
-- Separate MCP Deployment (HTTP + stdio) with TokenReview / SAR / impersonation
+- Separate MCP Deployment (HTTP + stdio) with TokenReview / SAR
 - Prometheus & VictoriaMetrics scrapes, embedded alerts, Grafana dashboard
 - Validating webhooks (`pvcName` or `pvcNames`)
 

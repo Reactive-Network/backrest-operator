@@ -167,11 +167,17 @@ spec:
                     enabled:
                       type: boolean
                       default: false
+                      description: >-
+                        Require HTTP Basic auth on the Backrest host API and UI. Needs existingSecret.
+                        The operator writes the auth block of the host config on every sync: this
+                        user when true, auth.disabled when false.
                     existingSecret:
                       type: string
                       description: >-
-                        Existing Secret containing Backrest auth credentials.
-                        Key names depend on Backrest auth support.
+                        Secret in the BackrestCluster namespace with keys username and password.
+                        The operator hashes the password (bcrypt) into the host config and uses the
+                        pair for its own API calls. Point the chart value backrestAuth.existingSecret
+                        at the same Secret so the MCP server can authenticate too.
                 monitoring:
                   type: object
                   properties:

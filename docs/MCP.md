@@ -38,9 +38,11 @@ curl -sS -X POST "http://127.0.0.1:8081/mcp" \
 1. Client sends `Authorization: Bearer <token>`.
 2. MCP validates the token via Kubernetes **TokenReview**.
 3. Each tool call maps to a **SubjectAccessReview** against CR resources in `operator.backrest.io`.
-4. API mutations use **user impersonation** so ClusterRoles remain the source of truth.
+4. A tool runs only when its SubjectAccessReview allows the caller; the call itself then uses the MCP pod ServiceAccount.
 
-The MCP pod ServiceAccount needs only: `tokenreviews`, `subjectaccessreviews`, and `impersonate` on users/groups — not blanket CR admin.
+The MCP pod ServiceAccount holds `tokenreviews`, `subjectaccessreviews`, the `operator.backrest.io` CRs and Jobs. It has no `impersonate`: an `impersonate` rule without `resourceNames` lets the SA act as `system:masters`, which is cluster-admin.
+
+When the Backrest host has auth enabled, set the chart value `backrestAuth.existingSecret` so the MCP container gets `BACKREST_AUTH_USERNAME` / `BACKREST_AUTH_PASSWORD`.
 
 Port-forward for local access:
 

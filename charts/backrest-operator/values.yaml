@@ -47,6 +47,12 @@ operator:
       duration: 8760h
       renewBefore: 720h
 
+# Backrest API credentials (HTTP Basic) for the operator and MCP clients. Name the same Secret as
+# BackrestCluster.spec.auth.existingSecret (keys: username, password; in the release namespace).
+# The operator reads that Secret itself as well; MCP has no Secret access and needs this env.
+backrestAuth:
+  existingSecret: ""
+
 mcp:
   enabled: true
   replicaCount: 1

@@ -49,7 +49,23 @@ kubectl apply -f examples/backrestcluster.yaml
 kubectl get backrestcluster -n backrest-system
 ```
 
-The host persists configuration on a PVC. Agents connect to the host Service on port `9898`.
+The host keeps its data (oplog, `jwt-secret`) on a PVC, but not its config file: a restarted host starts with Backrest's default config (auth disabled, no repositories). The operator notices the host Deployment change and writes instance, auth and the missing repositories back. Agents connect to the host Service on port `9898`.
+
+### Backrest API authentication
+
+Backrest checks HTTP Basic auth (or a UI login JWT) on its API once `auth` is enabled in its config. The operator owns that block:
+
+1. Create the Secret in the BackrestCluster namespace, without a trailing newline in the values:
+
+   ```bash
+   kubectl -n backrest-system create secret generic backrest-api-auth \
+     --from-literal=username=operator --from-literal=password="$(openssl rand -base64 33)"
+   ```
+
+2. Let the MCP server use it: Helm value `backrestAuth.existingSecret: backrest-api-auth`, then upgrade the chart. The operator reads the Secret itself.
+3. Set `spec.auth.existingSecret: backrest-api-auth` and `spec.auth.enabled: true` on the BackrestCluster. On every sync the operator writes `auth.users` (this one user, password as base64 bcrypt) and sends Basic auth on its own calls; users added by hand in the UI are removed. With `enabled: false` it writes `auth.disabled: true`.
+
+Not affected: multihost agent sync (`/v1sync.BackrestSyncService`, key-based) and signed `/download/` links. Affected: the UI, `/metrics` on the host, and every other `/v1.Backrest/*` caller, which now needs the credentials. A UI behind an auth proxy must inject `Authorization: Basic ...` itself, or users log in with the Backrest user.
 
 See [examples/backrestcluster.yaml](../examples/backrestcluster.yaml).
 

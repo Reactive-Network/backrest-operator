@@ -185,3 +185,26 @@ Watch namespaces env value
 {{- else }}
 {{- end }}
 {{- end }}
+
+{{/*
+Backrest API credentials (HTTP Basic) for the operator and MCP clients, from the Secret that
+BackrestCluster.spec.auth.existingSecret names. `default dict` keeps `helm upgrade --reuse-values`
+working for releases installed before backrestAuth existed.
+*/}}
+{{- define "backrest-operator.backrestAuthEnv" -}}
+{{- $auth := .Values.backrestAuth | default dict -}}
+{{- with $auth.existingSecret }}
+- name: BACKREST_AUTH_USERNAME
+  valueFrom:
+    secretKeyRef:
+      name: {{ . | quote }}
+      key: username
+      optional: true
+- name: BACKREST_AUTH_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ . | quote }}
+      key: password
+      optional: true
+{{- end }}
+{{- end }}
