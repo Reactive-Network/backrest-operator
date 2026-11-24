@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -13,10 +14,117 @@ import (
 
 	operatorv1alpha1 "github.com/Reactive-Network/backrest-operator/api/v1alpha1"
 	"github.com/Reactive-Network/backrest-operator/internal/backrest"
+	"github.com/Reactive-Network/backrest-operator/internal/filters"
 )
 
-func hostClientForCluster(clusterNS, clusterName string) *backrest.Client {
-	return backrest.NewClient(backrest.HostURL(clusterNS, clusterName))
+// hostURLFor is swapped in tests to point at a fake Backrest.
+var hostURLFor = backrest.HostURL
+
+// hostClientForCluster returns a client for the BackrestCluster's host and the auth policy the
+// operator enforces there. The client authenticates with the Secret named by
+// spec.auth.existingSecret (keys username, password) when set, else with BACKREST_AUTH_* env.
+// The policy is nil when the BackrestCluster does not exist; auth on such a host is left alone.
+func hostClientForCluster(ctx context.Context, c client.Client, clusterNS, clusterName string) (*backrest.Client, *backrest.AuthPolicy, error) {
+	bc := backrest.NewClient(hostURLFor(clusterNS, clusterName))
+	var cluster operatorv1alpha1.BackrestCluster
+	if err := c.Get(ctx, types.NamespacedName{Namespace: clusterNS, Name: clusterName}, &cluster); err != nil {
+		if apierrors.IsNotFound(err) {
+			return bc, nil, nil
+		}
+		return nil, nil, err
+	}
+	policy, creds, err := hostAuthForCluster(ctx, c, &cluster)
+	if err != nil {
+		return nil, nil, err
+	}
+	bc.WithCredentials(creds)
+	return bc, policy, nil
+}
+
+// hostAuthForCluster reads spec.auth. With auth disabled the policy writes {disabled: true};
+// the Secret is still read when named, so the client keeps working while auth is switched off.
+func hostAuthForCluster(ctx context.Context, c client.Client, cluster *operatorv1alpha1.BackrestCluster) (*backrest.AuthPolicy, backrest.Credentials, error) {
+	spec := cluster.Spec.Auth
+	var creds backrest.Credentials
+	if spec.ExistingSecret != "" {
+		var sec corev1.Secret
+		err := c.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: spec.ExistingSecret}, &sec)
+		switch {
+		case err == nil:
+			creds = backrest.Credentials{
+				Username: strings.TrimSpace(string(sec.Data[backrest.SecretKeyUsername])),
+				Password: string(sec.Data[backrest.SecretKeyPassword]),
+			}
+		case apierrors.IsNotFound(err) && !spec.Enabled:
+			// Optional while auth is off.
+		default:
+			return nil, creds, fmt.Errorf("backrest auth secret %s/%s: %w", cluster.Namespace, spec.ExistingSecret, err)
+		}
+	}
+	if !spec.Enabled {
+		return &backrest.AuthPolicy{Enabled: false}, creds, nil
+	}
+	if spec.ExistingSecret == "" {
+		return nil, creds, fmt.Errorf("BackrestCluster %s/%s: spec.auth.enabled requires spec.auth.existingSecret", cluster.Namespace, cluster.Name)
+	}
+	if creds.Empty() {
+		return nil, creds, fmt.Errorf("backrest auth secret %s/%s: keys %q and %q must both be set", cluster.Namespace, spec.ExistingSecret, backrest.SecretKeyUsername, backrest.SecretKeyPassword)
+	}
+	return &backrest.AuthPolicy{Enabled: true, Users: []backrest.Credentials{creds}}, creds, nil
+}
+
+// connectHost returns a client for the host after making sure its instance ID and auth block
+// match the BackrestCluster. Every sync goes through here, so auth is rewritten on each one.
+func connectHost(ctx context.Context, c client.Client, clusterNS, clusterName string) (*backrest.Client, error) {
+	bc, policy, err := hostClientForCluster(ctx, c, clusterNS, clusterName)
+	if err != nil {
+		return nil, err
+	}
+	if err := bc.EnsureHostConfig(ctx, instanceForCluster(clusterName), policy); err != nil {
+		return nil, fmt.Errorf("ensure backrest instance: %w", err)
+	}
+	return bc, nil
+}
+
+// syncClusterHost brings a running host back in line with the cluster. Backrest keeps its
+// config outside the PVC, so a restarted host comes up with the default config: auth disabled
+// and no repositories. This restores instance and auth, then re-adds missing repositories.
+func syncClusterHost(ctx context.Context, c client.Client, cluster *operatorv1alpha1.BackrestCluster) error {
+	bc, err := connectHost(ctx, c, cluster.Namespace, cluster.Name)
+	if err != nil {
+		return err
+	}
+	cfg, err := bc.GetConfig(ctx)
+	if err != nil {
+		return err
+	}
+	present := make(map[string]struct{}, len(cfg.Repos))
+	for _, r := range cfg.Repos {
+		present[r.ID] = struct{}{}
+	}
+	var repos operatorv1alpha1.BackupRepositoryList
+	if err := c.List(ctx, &repos); err != nil {
+		return err
+	}
+	var errs []error
+	for i := range repos.Items {
+		repo := &repos.Items[i]
+		if !repo.Spec.Backrest.SyncToHost || !filters.ObjectAllowed(repo.Namespace, repo.Labels) {
+			continue
+		}
+		ns, name := resolveClusterRef(repo.Spec.Backrest.ClusterRef, repo.Namespace)
+		if ns != cluster.Namespace || name != cluster.Name {
+			continue
+		}
+		if _, ok := present[repo.Name]; ok {
+			continue
+		}
+		log.FromContext(ctx).Info("repository missing on Backrest host, re-adding", "repo", repo.Name, "namespace", repo.Namespace)
+		if err := syncRepositoryToHost(ctx, c, repo); err != nil {
+			errs = append(errs, fmt.Errorf("repo %s/%s: %w", repo.Namespace, repo.Name, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func resolveClusterRef(ref operatorv1alpha1.ObjectReference, defaultNS string) (ns, name string) {
@@ -106,10 +214,9 @@ func syncRepositoryToHost(ctx context.Context, c client.Client, repo *operatorv1
 	}
 	logger := log.FromContext(ctx).WithValues("backuprepository", client.ObjectKeyFromObject(repo))
 	clusterNS, clusterName := resolveClusterRef(repo.Spec.Backrest.ClusterRef, repo.Namespace)
-	bc := hostClientForCluster(clusterNS, clusterName)
-	instance := instanceForCluster(clusterName)
-	if err := bc.EnsureInstance(ctx, instance); err != nil {
-		return fmt.Errorf("ensure backrest instance: %w", err)
+	bc, err := connectHost(ctx, c, clusterNS, clusterName)
+	if err != nil {
+		return err
 	}
 	pw, err := readSecretKey(ctx, c, repo.Namespace, repo.Spec.PasswordSecretRef.Name, keyOr(repo.Spec.PasswordSecretRef.Key, "RESTIC_PASSWORD"))
 	if err != nil {
@@ -144,8 +251,8 @@ func syncPlanToHost(ctx context.Context, c client.Client, plan *operatorv1alpha1
 	if repo != nil && repo.Spec.Backrest.ClusterRef.Name != "" {
 		clusterNS, clusterName = resolveClusterRef(repo.Spec.Backrest.ClusterRef, repo.Namespace)
 	}
-	bc := hostClientForCluster(clusterNS, clusterName)
-	if err := bc.EnsureInstance(ctx, instanceForCluster(clusterName)); err != nil {
+	bc, err := connectHost(ctx, c, clusterNS, clusterName)
+	if err != nil {
 		return err
 	}
 	repoID := plan.Spec.RepositoryRef.Name
@@ -182,8 +289,8 @@ func syncPVCBackupPlanToHost(ctx context.Context, c client.Client, b *operatorv1
 		return nil
 	}
 	clusterNS, clusterName := resolveClusterRef(repo.Spec.Backrest.ClusterRef, repo.Namespace)
-	bc := hostClientForCluster(clusterNS, clusterName)
-	if err := bc.EnsureInstance(ctx, instanceForCluster(clusterName)); err != nil {
+	bc, err := connectHost(ctx, c, clusterNS, clusterName)
+	if err != nil {
 		return err
 	}
 	retention := map[string]interface{}{}
@@ -224,7 +331,10 @@ func removePVCBackupPlanFromHost(ctx context.Context, c client.Client, b *operat
 		return nil
 	}
 	clusterNS, clusterName := resolveClusterRef(repo.Spec.Backrest.ClusterRef, repo.Namespace)
-	bc := hostClientForCluster(clusterNS, clusterName)
+	bc, _, err := hostClientForCluster(ctx, c, clusterNS, clusterName)
+	if err != nil {
+		return err
+	}
 	planID := planIDForPVCBackup(b)
 	if err := bc.DeletePlan(ctx, planID); err != nil {
 		return err

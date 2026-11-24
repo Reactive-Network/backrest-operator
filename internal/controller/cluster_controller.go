@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -71,7 +72,49 @@ func (r *BackrestClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	if phase == "Degraded" || phase == "Failed" {
 		logger.Info("cluster not ready", "phase", phase, "hostReady", hostReady, "agents", fmt.Sprintf("%d/%d", agentsReady, agentsDesired))
 	}
-	return r.patchStatus(ctx, &cluster, phase, hostReady, agentsReady, agentsDesired, paired)
+	// A host pod restart also changes the owned Deployment, so this runs right after the new
+	// Backrest comes up with its default config (auth disabled, no repositories).
+	var requeue time.Duration
+	if hostReady {
+		if err := syncClusterHost(ctx, r.Client, &cluster); err != nil {
+			metrics.ReconcileErrors.WithLabelValues("BackrestCluster").Inc()
+			logger.Error(err, "sync Backrest host config")
+			requeue = hostSyncRetry
+		} else if cluster.Spec.Auth.Enabled {
+			requeue = hostAuthResync
+		}
+	}
+	res, err := r.patchStatus(ctx, &cluster, phase, hostReady, agentsReady, agentsDesired, paired)
+	if err == nil && requeue > 0 {
+		res.RequeueAfter = requeue
+	}
+	return res, err
+}
+
+const (
+	// hostSyncRetry is the retry delay after a failed host config sync.
+	hostSyncRetry = 30 * time.Second
+	// hostAuthResync re-checks the auth block while auth is enabled, in case the host config
+	// was changed by hand or the host restarted without an event reaching the operator.
+	hostAuthResync = 5 * time.Minute
+	// annRestartedAt is set on the pod template by `kubectl rollout restart`.
+	annRestartedAt = "kubectl.kubernetes.io/restartedAt"
+)
+
+// keepRestartedAt copies the rollout-restart annotation from the live pod template into the
+// desired one. Without it the operator's next template update drops the annotation, which rolls
+// the host (and its config) or every agent a second time.
+func keepRestartedAt(cur, desired *corev1.PodTemplateSpec) {
+	v, ok := cur.Annotations[annRestartedAt]
+	if !ok {
+		return
+	}
+	if desired.Annotations == nil {
+		desired.Annotations = map[string]string{}
+	}
+	if _, set := desired.Annotations[annRestartedAt]; !set {
+		desired.Annotations[annRestartedAt] = v
+	}
 }
 
 func (r *BackrestClusterReconciler) patchStatus(ctx context.Context, c *operatorv1alpha1.BackrestCluster, phase string, hostReady bool, ready, desired, paired int32) (ctrl.Result, error) {
@@ -476,6 +519,7 @@ func (r *BackrestClusterReconciler) createOrUpdateDep(ctx context.Context, desir
 			desired.Spec.Template.Labels = cur.Spec.Selector.MatchLabels
 		}
 	}
+	keepRestartedAt(&cur.Spec.Template, &desired.Spec.Template)
 	cur.Spec.Replicas = desired.Spec.Replicas
 	cur.Spec.Strategy = desired.Spec.Strategy
 	cur.Spec.Template = desired.Spec.Template
@@ -500,6 +544,7 @@ func (r *BackrestClusterReconciler) createOrUpdateDS(ctx context.Context, desire
 			desired.Spec.Template.Labels = cur.Spec.Selector.MatchLabels
 		}
 	}
+	keepRestartedAt(&cur.Spec.Template, &desired.Spec.Template)
 	cur.Spec.Template = desired.Spec.Template
 	if desired.Labels != nil {
 		cur.Labels = desired.Labels

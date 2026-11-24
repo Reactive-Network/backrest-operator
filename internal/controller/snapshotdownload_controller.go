@@ -119,7 +119,10 @@ func (r *SnapshotDownloadReconciler) mint(ctx context.Context, sd *operatorv1alp
 		return nil, err
 	}
 	clusterNS, clusterName := resolveClusterRef(repo.Spec.Backrest.ClusterRef, repo.Namespace)
-	bc := hostClientForCluster(clusterNS, clusterName)
+	bc, _, err := hostClientForCluster(ctx, r.Client, clusterNS, clusterName)
+	if err != nil {
+		return nil, err
+	}
 
 	publicBase := sd.Spec.PublicBaseURL
 	if publicBase == "" {
