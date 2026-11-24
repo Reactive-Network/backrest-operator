@@ -46,16 +46,28 @@ func (f *fakeBackrest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.URL.Path {
 	case "/v1.Backrest/GetConfig":
-		_ = json.NewEncoder(w).Encode(f.cfg)
+		_ = json.NewEncoder(w).Encode(sanitizedConfig(f.cfg))
 	case "/v1.Backrest/SetConfig":
 		var in backrest.Config
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.Modno != f.cfg.Modno {
 			http.Error(w, "bad config or modno mismatch", http.StatusBadRequest)
 			return
 		}
+		// Backrest v1.14.1 RehydrateNetworkSanitizedConfig: "********" means the stored hash.
+		if in.Auth != nil && f.cfg.Auth != nil {
+			users := append([]backrest.User(nil), in.Auth.Users...)
+			for i, u := range users {
+				for _, fu := range f.cfg.Auth.Users {
+					if u.PasswordBcrypt == backrest.SanitizedPasswordBcrypt && fu.Name == u.Name {
+						users[i] = fu
+					}
+				}
+			}
+			in.Auth = &backrest.Auth{Disabled: in.Auth.Disabled, Users: users}
+		}
 		in.Modno++
 		f.cfg = in
-		_ = json.NewEncoder(w).Encode(f.cfg)
+		_ = json.NewEncoder(w).Encode(sanitizedConfig(f.cfg))
 	case "/v1.Backrest/AddRepo":
 		var in struct {
 			Repo backrest.Repo `json:"repo"`
@@ -72,6 +84,20 @@ func (f *fakeBackrest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// sanitizedConfig is Backrest v1.14.1 SanitizeForNetwork: password hashes go out as "********".
+func sanitizedConfig(c backrest.Config) backrest.Config {
+	if c.Auth != nil {
+		users := append([]backrest.User(nil), c.Auth.Users...)
+		for i := range users {
+			if users[i].PasswordBcrypt != "" {
+				users[i].PasswordBcrypt = backrest.SanitizedPasswordBcrypt
+			}
+		}
+		c.Auth = &backrest.Auth{Disabled: c.Auth.Disabled, Users: users}
+	}
+	return c
 }
 
 func (f *fakeBackrest) snapshot() backrest.Config {

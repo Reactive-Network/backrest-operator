@@ -164,7 +164,13 @@ func (c *Client) EnsureHostConfig(ctx context.Context, instance string, auth *Au
 		cfg.Instance = instance
 		changed = true
 	}
-	authChanged, err := auth.Apply(cfg)
+	// With auth on, Backrest answered GetConfig only after checking this client's Basic
+	// credentials, which proves them against the stored hash it no longer returns.
+	var proven Credentials
+	if cfg.Auth != nil && !cfg.Auth.Disabled && len(cfg.Auth.Users) > 0 {
+		proven = c.Credentials
+	}
+	authChanged, err := auth.ApplyAuthenticated(cfg, proven)
 	if err != nil {
 		return fmt.Errorf("backrest auth: %w", err)
 	}

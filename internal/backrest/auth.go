@@ -28,8 +28,14 @@ type Auth struct {
 	Users    []User `json:"users,omitempty"`
 }
 
+// SanitizedPasswordBcrypt is what Backrest's GetConfig and SetConfig return in place of every
+// stored password hash (config.SanitizeForNetwork). SetConfig turns this value back into the
+// stored hash of the user with the same name (config.RehydrateNetworkSanitizedConfig), so a
+// config read over the API can be written back without touching passwords.
+const SanitizedPasswordBcrypt = "********"
+
 // User mirrors Backrest's v1.User. PasswordBcrypt is base64(bcrypt(password)),
-// the encoding Backrest's checkPassword expects.
+// the encoding Backrest's checkPassword expects, or SanitizedPasswordBcrypt when read over the API.
 type User struct {
 	Name           string `json:"name"`
 	PasswordBcrypt string `json:"passwordBcrypt,omitempty"`
@@ -90,6 +96,14 @@ type AuthPolicy struct {
 // A stored hash is kept while it still matches the password, so a sync does not
 // rewrite the config (and bump modno) every time.
 func (p *AuthPolicy) Apply(cfg *Config) (bool, error) {
+	return p.ApplyAuthenticated(cfg, Credentials{})
+}
+
+// ApplyAuthenticated is Apply for a cfg read from Backrest with the credentials in proven while
+// its auth was on. Backrest returns every hash as SanitizedPasswordBcrypt, so the hash itself
+// cannot be checked; but it answered only after checking proven against that hash, so a policy
+// user equal to proven is known to be stored with the right password and is kept as is.
+func (p *AuthPolicy) ApplyAuthenticated(cfg *Config, proven Credentials) (bool, error) {
 	if p == nil || cfg == nil {
 		return false, nil
 	}
@@ -120,7 +134,8 @@ func (p *AuthPolicy) Apply(cfg *Config) (bool, error) {
 			return false, fmt.Errorf("auth user %q listed twice", cr.Username)
 		}
 		seen[cr.Username] = struct{}{}
-		if stored, ok := existing[cr.Username]; ok && PasswordMatches(stored, cr.Password) {
+		stored, ok := existing[cr.Username]
+		if ok && (PasswordMatches(stored, cr.Password) || (stored == SanitizedPasswordBcrypt && !proven.Empty() && proven == cr)) {
 			users = append(users, User{Name: cr.Username, PasswordBcrypt: stored})
 			if !changed && cfg.Auth.Users[i].Name != cr.Username {
 				changed = true

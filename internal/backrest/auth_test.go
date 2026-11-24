@@ -110,8 +110,76 @@ func TestCredentialsFromEnv(t *testing.T) {
 	}
 }
 
+func TestAuthPolicyApplyAuthenticatedSanitizedHash(t *testing.T) {
+	op := Credentials{Username: "operator", Password: "pw1"}
+	enabled := &AuthPolicy{Enabled: true, Users: []Credentials{op}}
+	sanitized := func() *Config {
+		return &Config{Auth: &Auth{Users: []User{{Name: "operator", PasswordBcrypt: SanitizedPasswordBcrypt}}}}
+	}
+
+	// Read with the policy's own credentials: the hash is proven, nothing to write.
+	cfg := sanitized()
+	if changed, err := enabled.ApplyAuthenticated(cfg, op); err != nil || changed {
+		t.Fatalf("proven user: changed=%v err=%v", changed, err)
+	}
+	if cfg.Auth.Users[0].PasswordBcrypt != SanitizedPasswordBcrypt {
+		t.Fatal("proven user must keep the placeholder (Backrest rehydrates it)")
+	}
+	// Not proven (no credentials, or other ones): rehash.
+	for _, proven := range []Credentials{{}, {Username: "operator", Password: "old"}, {Username: "x", Password: "pw1"}} {
+		cfg = sanitized()
+		changed, err := enabled.ApplyAuthenticated(cfg, proven)
+		if err != nil || !changed || !PasswordMatches(cfg.Auth.Users[0].PasswordBcrypt, "pw1") {
+			t.Fatalf("proven=%+v: changed=%v err=%v", proven, changed, err)
+		}
+	}
+	// Apply (no proof) on a sanitized config rehashes.
+	cfg = sanitized()
+	if changed, _ := enabled.Apply(cfg); !changed {
+		t.Fatal("Apply without proof must rehash a sanitized hash")
+	}
+}
+
+// sanitizeForNetwork and rehydrateSanitized mirror Backrest v1.14.1
+// internal/config/networksanitize.go: GetConfig and SetConfig return every password hash as
+// "********", and SetConfig puts the stored hash back for that value, by user name.
+func sanitizeForNetwork(c Config) Config {
+	if c.Auth != nil {
+		a := *c.Auth
+		a.Users = append([]User(nil), a.Users...)
+		for i := range a.Users {
+			if a.Users[i].PasswordBcrypt != "" {
+				a.Users[i].PasswordBcrypt = SanitizedPasswordBcrypt
+			}
+		}
+		c.Auth = &a
+	}
+	return c
+}
+
+func rehydrateSanitized(in, full Config) Config {
+	if in.Auth == nil || full.Auth == nil {
+		return in
+	}
+	a := *in.Auth
+	a.Users = append([]User(nil), a.Users...)
+	for i, u := range a.Users {
+		if u.PasswordBcrypt != SanitizedPasswordBcrypt {
+			continue
+		}
+		for _, fu := range full.Auth.Users {
+			if fu.Name == u.Name {
+				a.Users[i] = fu
+			}
+		}
+	}
+	in.Auth = &a
+	return in
+}
+
 // fakeHost mimics the parts of Backrest the client uses: GetConfig/SetConfig with modno
-// checks, and RequireAuthentication (Basic auth checked only while auth is enabled).
+// checks and password hash sanitizing, and RequireAuthentication (Basic auth checked only
+// while auth is enabled).
 type fakeHost struct {
 	mu       sync.Mutex
 	cfg      Config
@@ -138,7 +206,7 @@ func (f *fakeHost) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.URL.Path {
 	case "/v1.Backrest/GetConfig":
-		_ = json.NewEncoder(w).Encode(f.cfg)
+		_ = json.NewEncoder(w).Encode(sanitizeForNetwork(f.cfg))
 	case "/v1.Backrest/SetConfig":
 		var in Config
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
@@ -149,6 +217,7 @@ func (f *fakeHost) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "config modno mismatch", http.StatusBadRequest)
 			return
 		}
+		in = rehydrateSanitized(in, f.cfg)
 		if in.Auth != nil && !in.Auth.Disabled && len(in.Auth.Users) == 0 {
 			http.Error(w, "auth enabled but no users", http.StatusBadRequest)
 			return
@@ -156,7 +225,7 @@ func (f *fakeHost) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		in.Modno++
 		f.cfg = in
 		f.setCalls++
-		_ = json.NewEncoder(w).Encode(f.cfg)
+		_ = json.NewEncoder(w).Encode(sanitizeForNetwork(f.cfg))
 	default:
 		http.NotFound(w, r)
 	}
@@ -186,6 +255,24 @@ func TestClientEnablesAuthAndKeepsWorking(t *testing.T) {
 	}
 	if host.setCalls != 1 {
 		t.Fatalf("unchanged config must not be written again, sets=%d", host.setCalls)
+	}
+	// A read-modify-write (what UpsertPlan does) sends the sanitized hash back; the password
+	// must keep working and the next sync must still be a no-op.
+	got, err := bc.GetConfig(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Auth == nil || len(got.Auth.Users) != 1 || got.Auth.Users[0].PasswordBcrypt != SanitizedPasswordBcrypt {
+		t.Fatalf("fake must sanitize like Backrest: %+v", got.Auth)
+	}
+	if _, err := bc.SetConfig(ctx, got); err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	if err := bc.EnsureHostConfig(ctx, "main", policy); err != nil {
+		t.Fatalf("sync after round trip: %v", err)
+	}
+	if host.setCalls != 2 {
+		t.Fatalf("only the round trip may write, sets=%d", host.setCalls)
 	}
 	if _, err := NewClient(srv.URL).GetConfig(ctx); err == nil || !strings.Contains(err.Error(), "HTTP 401") {
 		t.Fatalf("client without credentials: err=%v", err)
